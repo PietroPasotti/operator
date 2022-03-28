@@ -923,15 +923,52 @@ class ResourceMeta:
 
     Attributes:
         resource_name: Name of resource
-        filename: Name of file
-        description: A text description of resource
+        filename: Name of file (default None)
+        description: A text description of resource (default '')
+
+    If metadata.yaml attaches extra keys to the resource, those are available
+    in the same way. For example if metadata.yaml reads:
+
+        name: charm
+        resources:
+          my-image:
+            type: oci-image
+            description: foo bar baz. qux!
+            upstream-source: some/address:10.230132.5
+            foozies: barsies
+            foozies#!@%[]: barsies#!@%[]
+
+    then you can:
+    >>> charm.meta.resources["my-image"].type == "oci-image"
+    keys including dashes are converted to underscores
+    >>> charm.meta.resources["my-image"].upstream_source == "some/address:10.230132.5"
+    keys including characters other than dashes which would be illegal for a
+    python identifier are not converted and are available via getitem.
+    >>> charm.meta.resources["my-image"]["foozies#!@%[]"] == "barsies#!@%[]"
     """
 
     def __init__(self, name, raw):
+        self._raw = raw
         self.resource_name = name
         self.type = raw['type']
         self.filename = raw.get('filename', None)
         self.description = raw.get('description', '')
+
+    def __getattr__(self, item: str):
+        if item in self._raw:
+            return self._raw[item]
+        raise AttributeError(item)
+
+    def __getitem__(self, item: str):
+        try:
+            return getattr(self, item)
+        except AttributeError:
+            pass
+
+        try:
+            return self._raw[item]
+        except KeyError:
+            raise KeyError("Resource %s has no key %s" % (self.resource_name, item)) from None
 
 
 class PayloadMeta:

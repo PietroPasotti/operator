@@ -527,3 +527,20 @@ containers:
 
         with self.assertRaises(RuntimeError):
             meta.containers["test1"].mounts["data"].location
+
+    def test_resources(self):
+        meta = CharmMeta.from_yaml("""
+name: k8s-charm
+resources:
+  my-image:
+    type: oci-image
+    description: foo bar baz. qux!
+    upstream-source: some/address:10.230132.5
+    foozies: barsies
+    foozies#!@%[]: barsies#!@%[]
+""")
+        self.assertIsNotNone(meta.resources.get('my-image'))
+        self.assertEqual(meta.resources['my-image'].type, 'oci-image')
+        self.assertEqual(meta.resources['my-image']['upstream-source'], 'some/address:10.230132.5')
+        self.assertEqual(meta.resources['my-image'].foozies, 'barsies')
+        self.assertEqual(meta.resources['my-image']['foozies#!@%[]'], 'barsies#!@%[]')
