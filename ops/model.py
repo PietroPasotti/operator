@@ -129,16 +129,13 @@ class Model:
         self._cache = _ModelCache(meta, backend)
         self._backend = backend
         self._unit = self.get_unit(self._backend.unit_name)
-        # fixme: remove cast after typing charm.py
-        relations = typing.cast('_RelationsMeta_Raw', meta.relations)  # type: ignore
+        relations = meta.relations  # type: _RelationsMeta_Raw
         self._relations = RelationMapping(relations, self.unit, self._backend, self._cache)
         self._config = ConfigData(self._backend)
-        # fixme: remove cast after typing charm.py
-        resources = typing.cast(Iterable[str], meta.resources)  # type: ignore
+        resources = meta.resources  # type: Iterable[str]
         self._resources = Resources(list(resources), self._backend)
         self._pod = Pod(self._backend)
-        # fixme: remove cast after typing charm.py
-        storages = typing.cast(Iterable[str], meta.storages)  # type: ignore
+        storages = meta.storages  # type: Iterable[str]
         self._storages = StorageMapping(list(storages), self._backend)
         self._bindings = BindingMapping(self._backend)
 
@@ -405,8 +402,7 @@ class Unit:
         self._status = None
 
         if self._is_our_unit and hasattr(meta, "containers"):
-            # fixme: remove cast when charm.py is typed
-            containers = typing.cast('_ContainerMeta_Raw', meta.containers)  # type: ignore
+            containers = meta.containers  # type: _ContainerMeta_Raw
             self._containers = ContainerMapping(iter(containers), backend)
 
     def _invalidate(self):
