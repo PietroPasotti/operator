@@ -1,4 +1,4 @@
-name: Observability Charm Tests
+name: Ingress Charms Tests
 
 on: [push, pull_request, workflow_call]
 
