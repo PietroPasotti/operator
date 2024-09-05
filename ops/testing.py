@@ -56,6 +56,7 @@ from typing import (
     cast,
 )
 
+import hook_tools
 from ops import charm, framework, model, pebble, storage
 from ops._private import yaml
 from ops.charm import CharmBase, CharmMeta, RelationRole
@@ -2626,7 +2627,7 @@ class _TestingModelBackend:
         # are setting results that will not work.
         # This also does some validation on keys to make sure that they fit the
         # Juju constraints.
-        model._format_action_result_dict(results)  # Validate, but ignore returned value.
+        hook_tools._format_action_result_dict(results)  # Validate, but ignore returned value.
         self._running_action.output.results.update(results)
 
     def action_log(self, message: str):
@@ -2657,7 +2658,7 @@ class _TestingModelBackend:
         raise NotImplementedError(self.add_metrics)  # type:ignore
 
     @classmethod
-    def log_split(cls, message, max_len=model.MAX_LOG_LINE_LEN):  # type:ignore
+    def log_split(cls, message, max_len=hook_tools.MAX_LOG_LINE_LEN):  # type:ignore
         raise NotImplementedError(cls.log_split)  # type:ignore
 
     def juju_log(self, level, msg):  # type:ignore

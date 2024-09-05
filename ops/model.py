@@ -18,15 +18,12 @@ import dataclasses
 import datetime
 import enum
 import ipaddress
-import json
 import logging
 import math
 import os
 import re
 import shutil
 import stat
-import subprocess
-import sys
 import tempfile
 import time
 import typing
@@ -48,12 +45,22 @@ from typing import (
     TextIO,
     Tuple,
     Type,
-    TypedDict,
     Union,
 )
 
 import ops
 import ops.pebble as pebble
+from hook_tools import (
+    _HookTools,
+    _RelationDataContent_Raw,
+    _StatusDict,
+    _NetworkDict,
+    _AddressDict,
+    Port,
+    ModelError,
+    RelationNotFoundError,
+    SecretNotFoundError,
+)
 from ops._private import timeconv, yaml
 from ops.jujucontext import _JujuContext
 from ops.jujuversion import JujuVersion
@@ -68,42 +75,14 @@ K8sSpec = Mapping[str, Any]
 _StorageDictType = Dict[str, Optional[List['Storage']]]
 _BindingDictType = Dict[Union[str, 'Relation'], 'Binding']
 
-_StatusDict = TypedDict('_StatusDict', {'status': str, 'message': str})
-
 # mapping from relation name to a list of relation objects
 _RelationMapping_Raw = Dict[str, Optional[List['Relation']]]
 # mapping from container name to container metadata
 _ContainerMeta_Raw = Dict[str, 'ops.charm.ContainerMeta']
 
-# relation data is a string key: string value mapping so far as the
-# controller is concerned
-_RelationDataContent_Raw = Dict[str, str]
 UnitOrApplicationType = Union[Type['Unit'], Type['Application']]
 
-_AddressDict = TypedDict(
-    '_AddressDict',
-    {
-        'address': str,  # Juju < 2.9
-        'value': str,  # Juju >= 2.9
-        'cidr': str,
-    },
-)
-_BindAddressDict = TypedDict(
-    '_BindAddressDict', {'interface-name': str, 'addresses': List[_AddressDict]}
-)
-_NetworkDict = TypedDict(
-    '_NetworkDict',
-    {
-        'bind-addresses': List[_BindAddressDict],
-        'ingress-addresses': List[str],
-        'egress-subnets': List[str],
-    },
-)
-
-
 logger = logging.getLogger(__name__)
-
-MAX_LOG_LINE_LEN = 131071  # Max length of strings to pass to subshell.
 
 
 class Model:
@@ -330,6 +309,7 @@ class _ModelCache:
 
     @typing.overload
     def get(self, entity_type: Type['Unit'], name: str) -> 'Unit': ...
+
     @typing.overload
     def get(self, entity_type: Type['Application'], name: str) -> 'Application': ...
 
@@ -792,24 +772,12 @@ class Unit:
         self._backend.reboot(now)
 
 
-@dataclasses.dataclass(frozen=True)
-class Port:
-    """Represents a port opened by :meth:`Unit.open_port` or :meth:`Unit.set_ports`."""
-
-    protocol: typing.Literal['tcp', 'udp', 'icmp']
-    """The IP protocol."""
-
-    port: Optional[int]
-    """The port number. Will be ``None`` if protocol is ``'icmp'``."""
-
-
 OpenedPort = Port
 """Alias to Port for backwards compatibility.
 
 .. deprecated:: 2.7.0
     Use :class:`Port` instead.
 """
-
 
 _LazyValueType = typing.TypeVar('_LazyValueType')
 
@@ -3034,12 +3002,6 @@ class CheckInfoMapping(Mapping[str, pebble.CheckInfo]):
         return repr(self._checks)
 
 
-class ModelError(Exception):
-    """Base class for exceptions raised when interacting with the Model."""
-
-    pass
-
-
 class TooManyRelatedAppsError(ModelError):
     """Raised by :meth:`Model.get_relation` if there is more than one integrated application."""
 
@@ -3073,80 +3035,8 @@ class RelationDataAccessError(RelationDataError):
     """
 
 
-class RelationNotFoundError(ModelError):
-    """Raised when querying Juju for a given relation and that relation doesn't exist."""
-
-
 class InvalidStatusError(ModelError):
     """Raised if trying to set an Application or Unit status to something invalid."""
-
-
-class SecretNotFoundError(ModelError):
-    """Raised when the specified secret does not exist."""
-
-
-_ACTION_RESULT_KEY_REGEX = re.compile(r'^[a-z0-9](([a-z0-9-.]+)?[a-z0-9])?$')
-
-
-def _format_action_result_dict(
-    input: Dict[str, Any],
-    parent_key: Optional[str] = None,
-    output: Optional[Dict[str, str]] = None,
-) -> Dict[str, str]:
-    """Turn a nested dictionary into a flattened dictionary, using '.' as a key seperator.
-
-    This is used to allow nested dictionaries to be translated into the dotted format required by
-    the Juju `action-set` hook tool in order to set nested data on an action.
-
-    Additionally, this method performs some validation on keys to ensure they only use permitted
-    characters.
-
-    Example::
-
-        >>> test_dict = {'a': {'b': 1, 'c': 2}}
-        >>> _format_action_result_dict(test_dict)
-        {'a.b': 1, 'a.c': 2}
-
-    Arguments:
-        input: The dictionary to flatten
-        parent_key: The string to prepend to dictionary's keys
-        output: The current dictionary to be returned, which may or may not yet be completely flat
-
-    Returns:
-        A flattened dictionary with validated keys
-
-    Raises:
-        ValueError: if the dict is passed with a mix of dotted/non-dotted keys that expand out to
-            result in duplicate keys. For example: {'a': {'b': 1}, 'a.b': 2}. Also raised if a dict
-            is passed with a key that fails to meet the format requirements.
-    """
-    output_: Dict[str, str] = output or {}
-
-    for key, value in input.items():
-        # Ensure the key is of a valid format, and raise a ValueError if not
-        if not isinstance(key, str):
-            # technically a type error, but for consistency with the
-            # other exceptions raised on key validation...
-            raise ValueError(f'invalid key {key!r}; must be a string')
-        if not _ACTION_RESULT_KEY_REGEX.match(key):
-            raise ValueError(
-                f"key {key!r} is invalid: must be similar to 'key', 'some-key2', or 'some.key'"
-            )
-
-        if parent_key:
-            key = f'{parent_key}.{key}'
-
-        if isinstance(value, MutableMapping):
-            value = typing.cast(Dict[str, Any], value)
-            output_ = _format_action_result_dict(value, key, output_)
-        elif key in output_:
-            raise ValueError(
-                f"duplicate key detected in dictionary passed to 'action-set': {key!r}"
-            )
-        else:
-            output_[key] = value
-
-    return output_
 
 
 class _ModelBackend:
@@ -3185,63 +3075,13 @@ class _ModelBackend:
         self._is_leader: Optional[bool] = None
         self._leader_check_time = None
         self._hook_is_running = ''
+        self._hook_tools = _HookTools(self._juju_context)
 
-    def _run(
-        self,
-        *args: str,
-        return_output: bool = False,
-        use_json: bool = False,
-        input_stream: Optional[str] = None,
-    ) -> Union[str, Any, None]:
-        kwargs = {
-            'stdout': subprocess.PIPE,
-            'stderr': subprocess.PIPE,
-            'check': True,
-            'encoding': 'utf-8',
-        }
-        if input_stream:
-            kwargs.update({'input': input_stream})
-        which_cmd = shutil.which(args[0])
-        if which_cmd is None:
-            raise RuntimeError(f'command not found: {args[0]}')
-        args = (which_cmd,) + args[1:]
-        if use_json:
-            args += ('--format=json',)
-        # TODO(benhoyt): all the "type: ignore"s below kinda suck, but I've
-        #                been fighting with Pyright for half an hour now...
-        try:
-            result = subprocess.run(args, **kwargs)  # type: ignore
-        except subprocess.CalledProcessError as e:
-            raise ModelError(e.stderr) from e
-        if return_output:
-            if result.stdout is None:  # type: ignore
-                return ''
-            else:
-                text: str = result.stdout  # type: ignore
-                if use_json:
-                    return json.loads(text)  # type: ignore
-                else:
-                    return text  # type: ignore
+    def relation_ids(self, relation_name: str) -> Tuple[int, ...]:
+        return self._hook_tools.relation_ids(relation_name=relation_name)
 
-    @staticmethod
-    def _is_relation_not_found(model_error: Exception) -> bool:
-        return 'relation not found' in str(model_error)
-
-    def relation_ids(self, relation_name: str) -> List[int]:
-        relation_ids = self._run('relation-ids', relation_name, return_output=True, use_json=True)
-        relation_ids = typing.cast(Iterable[str], relation_ids)
-        return [int(relation_id.split(':')[-1]) for relation_id in relation_ids]
-
-    def relation_list(self, relation_id: int) -> List[str]:
-        try:
-            rel_list = self._run(
-                'relation-list', '-r', str(relation_id), return_output=True, use_json=True
-            )
-            return typing.cast(List[str], rel_list)
-        except ModelError as e:
-            if self._is_relation_not_found(e):
-                raise RelationNotFoundError() from e
-            raise
+    def relation_list(self, relation_id: int) -> Tuple[str, ...]:
+        return self._hook_tools.relation_list(relation_id=relation_id)
 
     def relation_remote_app_name(self, relation_id: int) -> Optional[str]:
         """Return remote app name for given relation ID, or None if not known."""
@@ -3256,21 +3096,7 @@ class _ModelBackend:
 
         # If caller is asking for information about another relation, use
         # "relation-list --app" to get it.
-        try:
-            rel_id = self._run(
-                'relation-list', '-r', str(relation_id), '--app', return_output=True, use_json=True
-            )
-            # if it returned anything at all, it's a str.
-            return typing.cast(str, rel_id)
-
-        except ModelError as e:
-            if self._is_relation_not_found(e):
-                return None
-            if 'option provided but not defined: --app' in str(e):
-                # "--app" was introduced to relation-list in Juju 2.8.1, so
-                # handle previous versions of Juju gracefully
-                return None
-            raise
+        return self._hook_tools.relation_list(relation_id=relation_id, app_only=True)[0]
 
     def relation_get(
         self, relation_id: int, member_name: str, is_app: bool
@@ -3278,50 +3104,20 @@ class _ModelBackend:
         if not isinstance(is_app, bool):
             raise TypeError('is_app parameter to relation_get must be a boolean')
 
-        if is_app and not self._juju_context.version.has_app_data():
-            raise RuntimeError(
-                'getting application data is not supported on Juju version '
-                f'{self._juju_context.version}'
-            )
-
-        args = ['relation-get', '-r', str(relation_id), '-', member_name]
-        if is_app:
-            args.append('--app')
-
-        try:
-            raw_data_content = self._run(*args, return_output=True, use_json=True)
-            return typing.cast('_RelationDataContent_Raw', raw_data_content)
-        except ModelError as e:
-            if self._is_relation_not_found(e):
-                raise RelationNotFoundError() from e
-            raise
+        return self._hook_tools.relation_get(
+            relation_id=relation_id, member_name=member_name, app=is_app
+        )
 
     def relation_set(self, relation_id: int, key: str, value: str, is_app: bool) -> None:
         if not isinstance(is_app, bool):
             raise TypeError('is_app parameter to relation_set must be a boolean')
 
-        if is_app and not self._juju_context.version.has_app_data():
-            raise RuntimeError(
-                'setting application data is not supported on Juju version '
-                f'{self._juju_context.version}'
-            )
-
-        args = ['relation-set', '-r', str(relation_id)]
-        if is_app:
-            args.append('--app')
-        args.extend(['--file', '-'])
-
-        try:
-            content = yaml.safe_dump({key: value})
-            self._run(*args, input_stream=content)
-        except ModelError as e:
-            if self._is_relation_not_found(e):
-                raise RelationNotFoundError() from e
-            raise
+        return self._hook_tools.relation_set(
+            relation_id=relation_id, key=key, value=value, app=is_app
+        )
 
     def config_get(self) -> Dict[str, Union[bool, int, float, str]]:
-        out = self._run('config-get', return_output=True, use_json=True)
-        return typing.cast(Dict[str, Union[bool, int, float, str]], out)
+        return self._hook_tools.config_get()
 
     def is_leader(self) -> bool:
         """Obtain the current leadership status for the unit the charm code is executing on.
@@ -3338,15 +3134,14 @@ class _ModelBackend:
             # Current time MUST be saved before running is-leader to ensure the cache
             # is only used inside the window that is-leader itself asserts.
             self._leader_check_time = now
-            is_leader = self._run('is-leader', return_output=True, use_json=True)
-            self._is_leader = typing.cast(bool, is_leader)
+            is_leader = self._hook_tools.is_leader()
+            self._is_leader = is_leader
 
         # we can cast to bool now since if we're here it means we checked.
         return typing.cast(bool, self._is_leader)
 
     def resource_get(self, resource_name: str) -> str:
-        out = self._run('resource-get', resource_name, return_output=True)
-        return typing.cast(str, out).strip()
+        return self._hook_tools.resource_get(resource_name=resource_name)
 
     def pod_spec_set(
         self, spec: Mapping[str, Any], k8s_resources: Optional[Mapping[str, Any]] = None
@@ -3356,13 +3151,13 @@ class _ModelBackend:
             spec_path = tmpdir / 'spec.yaml'
             with spec_path.open('wt', encoding='utf8') as f:
                 yaml.safe_dump(spec, stream=f)
-            args = ['--file', str(spec_path)]
+            k8s_res_path = None
             if k8s_resources:
                 k8s_res_path = tmpdir / 'k8s-resources.yaml'
                 with k8s_res_path.open('wt', encoding='utf8') as f:
                     yaml.safe_dump(k8s_resources, stream=f)
-                args.extend(['--k8s-resources', str(k8s_res_path)])
-            self._run('pod-spec-set', *args)
+            self._hook_tools.pod_spec_set(spec_path, k8s_res_path)
+
         finally:
             shutil.rmtree(str(tmpdir))
 
@@ -3373,34 +3168,7 @@ class _ModelBackend:
             is_app: A boolean indicating whether the status should be retrieved for a unit
                 or an application.
         """
-        content = self._run(
-            'status-get',
-            '--include-data',
-            f'--application={is_app}',
-            use_json=True,
-            return_output=True,
-        )
-        # Unit status looks like (in YAML):
-        # message: 'load: 0.28 0.26 0.26'
-        # status: active
-        # status-data: {}
-        # Application status looks like (in YAML):
-        # application-status:
-        #   message: 'load: 0.28 0.26 0.26'
-        #   status: active
-        #   status-data: {}
-        #   units:
-        #     uo/0:
-        #       message: 'load: 0.28 0.26 0.26'
-        #       status: active
-        #       status-data: {}
-
-        if is_app:
-            content = typing.cast(Dict[str, Dict[str, str]], content)
-            app_status = content['application-status']
-            return {'status': app_status['status'], 'message': app_status['message']}
-        else:
-            return typing.cast('_StatusDict', content)
+        return self._hook_tools.status_get(app=is_app)
 
     def status_set(self, status: str, message: str = '', *, is_app: bool = False) -> None:
         """Set a status of a unit or an application.
@@ -3413,15 +3181,14 @@ class _ModelBackend:
         """
         if not isinstance(is_app, bool):
             raise TypeError('is_app parameter must be boolean')
-        self._run('status-set', f'--application={is_app}', status, message)
+
+        return self._hook_tools.status_set(status, message, app=is_app)
 
     def storage_list(self, name: str) -> List[int]:
-        storages = self._run('storage-list', name, return_output=True, use_json=True)
-        storages = typing.cast(List[str], storages)
-        return [int(s.split('/')[1]) for s in storages]
+        return self._hook_tools.storage_list(name)
 
     def _storage_event_details(self) -> Tuple[int, str]:
-        output = self._run('storage-get', '--help', return_output=True)
+        output = self._hook_tools._run('storage-get', '--help', return_output=True)
         output = typing.cast(str, output)
         # Match the entire string at once instead of going line by line
         match = self._STORAGE_KEY_RE.match(output)
@@ -3439,55 +3206,32 @@ class _ModelBackend:
                 'calling storage_get with `attribute=""` will return a dict '
                 'and not a string. This usage is not supported.'
             )
-        out = self._run(
-            'storage-get', '-s', storage_name_id, attribute, return_output=True, use_json=True
-        )
+        out = self._hook_tools.storage_get(storage_full_name=storage_name_id, key=attribute)
         return typing.cast(str, out)
 
     def storage_add(self, name: str, count: int = 1) -> None:
         if not isinstance(count, int) or isinstance(count, bool):
             raise TypeError(f'storage count must be integer, got: {count} ({type(count)})')
-        self._run('storage-add', f'{name}={count}')
+        self._hook_tools.storage_add(name=name, count=count)
 
     def action_get(self) -> Dict[str, Any]:
-        out = self._run('action-get', return_output=True, use_json=True)
-        return typing.cast(Dict[str, Any], out)
+        return self._hook_tools.action_get()
 
     def action_set(self, results: Dict[str, Any]) -> None:
-        # The Juju action-set hook tool cannot interpret nested dicts, so we use a helper to
-        # flatten out any nested dict structures into a dotted notation, and validate keys.
-        flat_results = _format_action_result_dict(results)
-        self._run('action-set', *[f'{k}={v}' for k, v in flat_results.items()])
+        self._hook_tools.action_set(results=results)
 
     def action_log(self, message: str) -> None:
-        self._run('action-log', message)
+        self._hook_tools.action_log(message)
 
     def action_fail(self, message: str = '') -> None:
-        self._run('action-fail', message)
+        self._hook_tools.action_fail(message)
 
     def application_version_set(self, version: str) -> None:
-        self._run('application-version-set', '--', version)
-
-    @classmethod
-    def log_split(
-        cls, message: str, max_len: int = MAX_LOG_LINE_LEN
-    ) -> Generator[str, None, None]:
-        """Helper to handle log messages that are potentially too long.
-
-        This is a generator that splits a message string into multiple chunks if it is too long
-        to safely pass to bash. Will only generate a single entry if the line is not too long.
-        """
-        if len(message) > max_len:
-            yield f'Log string greater than {max_len}. Splitting into multiple chunks: '
-
-        while message:
-            yield message[:max_len]
-            message = message[max_len:]
+        self._hook_tools.application_version_set(version)
 
     def juju_log(self, level: str, message: str) -> None:
         """Pass a log message on to the juju logger."""
-        for line in self.log_split(message):
-            self._run('juju-log', '--log-level', level, '--', line)
+        return self._hook_tools.juju_log(level, message)
 
     def network_get(self, binding_name: str, relation_id: Optional[int] = None) -> '_NetworkDict':
         """Return network info provided by network-get for a given binding.
@@ -3496,16 +3240,7 @@ class _ModelBackend:
             binding_name: A name of a binding (relation name or extra-binding name).
             relation_id: An optional relation id to get network info for.
         """
-        cmd = ['network-get', binding_name]
-        if relation_id is not None:
-            cmd.extend(['-r', str(relation_id)])
-        try:
-            network = self._run(*cmd, return_output=True, use_json=True)
-            return typing.cast('_NetworkDict', network)
-        except ModelError as e:
-            if self._is_relation_not_found(e):
-                raise RelationNotFoundError() from e
-            raise
+        return self._hook_tools.network_get(binding_name=binding_name, relation_id=relation_id)
 
     def add_metrics(
         self, metrics: Mapping[str, Union[int, float]], labels: Optional[Mapping[str, str]] = None
@@ -3525,7 +3260,7 @@ class _ModelBackend:
             metric_value = _ModelBackendValidator.format_metric_value(v)
             metric_args.append(f'{k}={metric_value}')
         cmd.extend(metric_args)
-        self._run(*cmd)
+        self._hook_tools._run(*cmd)
 
     def get_pebble(self, socket_path: str) -> pebble.Client:
         """Create a pebble.Client instance from given socket path."""
@@ -3541,8 +3276,7 @@ class _ModelBackend:
         # The goal-state tool will return the information that we need. Goal state as a general
         # concept is being deprecated, however, in favor of approaches such as the one that we use
         # here.
-        app_state = self._run('goal-state', return_output=True, use_json=True)
-        app_state = typing.cast(Dict[str, Dict[str, Any]], app_state)
+        app_state = self._hook_tools.goal_state()
 
         # Planned units can be zero. We don't need to do error checking here.
         # But we need to filter out dying units as they may be reported before being deleted
@@ -3563,48 +3297,17 @@ class _ModelBackend:
         refresh: bool = False,
         peek: bool = False,
     ) -> Dict[str, str]:
-        args: List[str] = []
-        if id is not None:
-            args.append(id)
-        if label is not None:
-            args.extend(['--label', label])
-        if refresh:
-            args.append('--refresh')
-        if peek:
-            args.append('--peek')
-        # IMPORTANT: Don't call shared _run_for_secret method here; we want to
-        # be extra sensitive inside secret_get to ensure we never
-        # accidentally log or output secrets, even if _run_for_secret changes.
-        try:
-            result = self._run('secret-get', *args, return_output=True, use_json=True)
-        except ModelError as e:
-            if 'not found' in str(e):
-                raise SecretNotFoundError() from e
-            raise
-        return typing.cast(Dict[str, str], result)
-
-    def _run_for_secret(
-        self, *args: str, return_output: bool = False, use_json: bool = False
-    ) -> Union[str, Any, None]:
-        try:
-            return self._run(*args, return_output=return_output, use_json=use_json)
-        except ModelError as e:
-            if 'not found' in str(e):
-                raise SecretNotFoundError() from e
-            raise
+        return self._hook_tools.secret_get(
+            id=id,
+            label=label,
+            refresh=refresh,
+            peek=peek,
+        )
 
     def secret_info_get(
         self, *, id: Optional[str] = None, label: Optional[str] = None
     ) -> SecretInfo:
-        args: List[str] = []
-        if id is not None:
-            args.append(id)
-        elif label is not None:  # elif because Juju secret-info-get doesn't allow id and label
-            args.extend(['--label', label])
-        result = self._run_for_secret('secret-info-get', *args, return_output=True, use_json=True)
-        info_dicts = typing.cast(Dict[str, Any], result)
-        id = list(info_dicts)[0]  # Juju returns dict of {secret_id: {info}}
-        return SecretInfo.from_dict(id, typing.cast(Dict[str, Any], info_dicts[id]))
+        return self._hook_tools.secret_info_get(id=id, label=label)
 
     def secret_set(
         self,
@@ -3616,22 +3319,14 @@ class _ModelBackend:
         expire: Optional[datetime.datetime] = None,
         rotate: Optional[SecretRotate] = None,
     ):
-        args = [id]
-        if label is not None:
-            args.extend(['--label', label])
-        if description is not None:
-            args.extend(['--description', description])
-        if expire is not None:
-            args.extend(['--expire', expire.isoformat()])
-        if rotate is not None:
-            args += ['--rotate', rotate.value]
-        with tempfile.TemporaryDirectory() as tmp:
-            # The content is None or has already been validated with Secret._validate_content
-            for k, v in (content or {}).items():
-                with open(f'{tmp}/{k}', mode='w', encoding='utf-8') as f:
-                    f.write(v)
-                args.append(f'{k}#file={tmp}/{k}')
-            self._run_for_secret('secret-set', *args)
+        return self._hook_tools.secret_set(
+            id=id,
+            content=content,
+            label=label,
+            description=description,
+            expire=expire,
+            rotate=rotate,
+        )
 
     def secret_add(
         self,
@@ -3643,100 +3338,42 @@ class _ModelBackend:
         rotate: Optional[SecretRotate] = None,
         owner: Optional[str] = None,
     ) -> str:
-        args: List[str] = []
-        if label is not None:
-            args.extend(['--label', label])
-        if description is not None:
-            args.extend(['--description', description])
-        if expire is not None:
-            args.extend(['--expire', expire.isoformat()])
-        if rotate is not None:
-            args += ['--rotate', rotate.value]
-        if owner is not None:
-            args += ['--owner', owner]
-        with tempfile.TemporaryDirectory() as tmp:
-            # The content has already been validated with Secret._validate_content
-            for k, v in content.items():
-                with open(f'{tmp}/{k}', mode='w', encoding='utf-8') as f:
-                    f.write(v)
-                args.append(f'{k}#file={tmp}/{k}')
-            result = self._run('secret-add', *args, return_output=True)
-        secret_id = typing.cast(str, result)
-        return secret_id.strip()
+        return self._hook_tools.secret_add(
+            content=content,
+            label=label,
+            description=description,
+            expire=expire,
+            rotate=rotate,
+            owner=owner,
+        )
 
     def secret_grant(self, id: str, relation_id: int, *, unit: Optional[str] = None):
-        args = [id, '--relation', str(relation_id)]
-        if unit is not None:
-            args += ['--unit', str(unit)]
-        self._run_for_secret('secret-grant', *args)
+        return self._hook_tools.secret_grant(id, relation_id, unit=unit)
 
     def secret_revoke(self, id: str, relation_id: int, *, unit: Optional[str] = None):
-        args = [id, '--relation', str(relation_id)]
-        if unit is not None:
-            args += ['--unit', str(unit)]
-        self._run_for_secret('secret-revoke', *args)
+        return self._hook_tools.secret_revoke(id, relation_id, unit=unit)
 
     def secret_remove(self, id: str, *, revision: Optional[int] = None):
-        args = [id]
-        if revision is not None:
-            args.extend(['--revision', str(revision)])
-        self._run_for_secret('secret-remove', *args)
+        return self._hook_tools.secret_remove(id, revision=revision)
 
     def open_port(self, protocol: str, port: Optional[int] = None):
-        arg = f'{port}/{protocol}' if port is not None else protocol
-        self._run('open-port', arg)
+        return self._hook_tools.open_port(protocol, port)
 
     def close_port(self, protocol: str, port: Optional[int] = None):
-        arg = f'{port}/{protocol}' if port is not None else protocol
-        self._run('close-port', arg)
+        return self._hook_tools.close_port(protocol, port)
 
     def opened_ports(self) -> Set[Port]:
-        # We could use "opened-ports --format=json", but it's not really
-        # structured; it's just an array of strings which are the lines of the
-        # text output, like ["icmp","8081/udp"]. So it's probably just as
-        # likely to change as the text output, and doesn't seem any better.
-        output = typing.cast(str, self._run('opened-ports', return_output=True))
-        ports: Set[Port] = set()
-        for line in output.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            port = self._parse_opened_port(line)
-            if port is not None:
-                ports.add(port)
-        return ports
-
-    @classmethod
-    def _parse_opened_port(cls, port_str: str) -> Optional[Port]:
-        if port_str == 'icmp':
-            return Port('icmp', None)
-        port_range, slash, protocol = port_str.partition('/')
-        if not slash or protocol not in ['tcp', 'udp']:
-            logger.warning('Unexpected opened-ports protocol: %s', port_str)
-            return None
-        port, hyphen, _ = port_range.partition('-')
-        if hyphen:
-            logger.warning('Ignoring opened-ports port range: %s', port_str)
-        protocol_lit = typing.cast(typing.Literal['tcp', 'udp'], protocol)
-        return Port(protocol_lit, int(port))
+        ports = self._hook_tools.opened_ports()
 
     def reboot(self, now: bool = False):
-        if now:
-            self._run('juju-reboot', '--now')
-            # Juju will kill the Charm process, and in testing no code after
-            # this point would execute. However, we want to guarantee that for
-            # Charmers, so we force that to be the case.
-            sys.exit()
-        else:
-            self._run('juju-reboot')
+        return self._hook_tools.reboot(now=now)
 
     def credential_get(self) -> 'CloudSpec':
         """Access cloud credentials by running the credential-get hook tool.
 
         Returns the cloud specification used by the model.
         """
-        result = self._run('credential-get', return_output=True, use_json=True)
-        return CloudSpec.from_dict(typing.cast(Dict[str, Any], result))
+        return self._hook_tools.credential_get()
 
 
 class _ModelBackendValidator:
